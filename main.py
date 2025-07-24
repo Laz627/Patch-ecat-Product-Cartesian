@@ -13,24 +13,20 @@ st.set_page_config(
 # --- Main Application ---
 st.title("Automated Data Pairing and Export Tool")
 st.markdown("""
-This tool helps you pair data from two spreadsheets and export the results into a multi-tab Excel file.
+This tool intelligently pairs items with their regional patch codes and exports the results.
 
 **Instructions:**
-1.  Upload the 'Items' spreadsheet containing `Item #`, `Model`, `Region`, and `VBU`.
-2.  Upload the 'Regions' spreadsheet containing the region patch codes.
-3.  The tool will generate all possible pairings.
+1.  Upload the 'Items' spreadsheet containing `Item #`, `Model`, `VBU`, and `Region`.
+2.  Upload the 'Region Patches' spreadsheet where columns are the region names (e.g., "East", "West").
+3.  The tool will match items to the patch codes based on their assigned region.
 4.  Click the 'Download Paired Data' button to get your formatted Excel file.
 """)
 
 # --- File Uploaders ---
 st.header("1. Upload Your Spreadsheets")
 
-# Uploader for the first spreadsheet (Items)
 file1 = st.file_uploader("Upload Items Spreadsheet (.xlsx)", type=["xlsx"])
-
-# Uploader for the second spreadsheet (Regions)
 file2 = st.file_uploader("Upload Region Patches Spreadsheet (.xlsx)", type=["xlsx"])
-
 
 # --- Main Logic: Process files only when both are uploaded ---
 if file1 and file2:
@@ -38,36 +34,44 @@ if file1 and file2:
         st.header("2. Processing and Generating Output")
 
         # --- Data Loading ---
-        df_items = pd.read_excel(file1)
-        df_regions = pd.read_excel(file2)
+        df_items = pd.read_excel(file1, dtype={'VBU': str}) # Read VBU as string to preserve formatting
+        df_regions_wide = pd.read_excel(file2)
 
         # --- Data Validation ---
-        # Validate columns in the first spreadsheet
-        required_item_cols = {'Item #', 'Model', 'Region', 'VBU'}
+        required_item_cols = {'Item #', 'Model', 'VBU', 'Region'}
         if not required_item_cols.issubset(df_items.columns):
-            st.error(f"Error: The first spreadsheet must contain the following columns: {', '.join(required_item_cols)}")
+            st.error(f"Error: The Items spreadsheet must contain the following columns: {', '.join(required_item_cols)}")
             st.stop()
 
-        # Validate the second spreadsheet is not empty and has one column
-        if df_regions.shape[1] != 1:
-            st.error("Error: The second spreadsheet should contain exactly one column with the region patch codes.")
+        if df_regions_wide.empty:
+            st.error("Error: The Region Patches spreadsheet cannot be empty.")
             st.stop()
+
+        # --- Data Transformation for Regions Spreadsheet ---
+        st.write("Transforming Region Patches data...")
         
-        # Standardize the column name for merging
-        region_patch_col_name = "Region patch code"
-        df_regions.columns = [region_patch_col_name]
+        # Melt the dataframe to unpivot it from a wide to a long format.
+        # This creates a mapping from each Region to its list of patch codes.
+        df_regions_long = pd.melt(df_regions_wide, var_name='Region', value_name='Region patch code')
+        
+        # Drop rows where the patch code is NaN/blank, which occurs with uneven columns.
+        df_regions_long.dropna(subset=['Region patch code'], inplace=True)
+        
+        st.write("Preview of transformed region data (first 5 rows):")
+        st.dataframe(df_regions_long.head())
 
-        # --- Data Pairing (Cross Join) ---
-        # Create a temporary key for a cartesian product merge
-        df_items['_key'] = 1
-        df_regions['_key'] = 1
+        # --- Region-Based Pairing (Merge) ---
+        # This is the key step. We merge the two tables on the 'Region' column.
+        # This pairs each item only with the patch codes that match its region.
+        st.write("Pairing items with patch codes based on matching regions...")
+        df_merged = pd.merge(df_items, df_regions_long, on='Region', how='left')
 
-        # Perform the merge and drop the temporary key
-        df_merged = pd.merge(df_items, df_regions, on='_key').drop('_key', axis=1)
+        # Drop rows that didn't find a matching region in the patch file
+        df_merged.dropna(subset=['Region patch code'], inplace=True)
 
         # --- Structure the Output ---
         # Reorder and select the desired columns for the final output
-        output_df = df_merged[['VBU', 'Item #', 'Model', region_patch_col_name]]
+        output_df = df_merged[['VBU', 'Item #', 'Model', 'Region patch code', 'Region']]
         
         st.success("Data has been successfully paired and structured!")
         st.write("Preview of the first 20 paired rows:")
@@ -76,37 +80,31 @@ if file1 and file2:
         # --- Excel Export Preparation ---
         st.header("3. Download Your File")
 
-        # Create an in-memory buffer for the Excel file
         output_buffer = io.BytesIO()
-
-        # Use ExcelWriter to write to multiple tabs in the buffer
         with pd.ExcelWriter(output_buffer, engine='openpyxl') as writer:
-            # Get unique region patches to create a tab for each
-            unique_regions = output_df[region_patch_col_name].unique()
-
-            for region in unique_regions:
-                # Filter the dataframe for the current region
-                df_region_specific = output_df[output_df[region_patch_col_name] == region]
+            # Group by the 'Region' column (East, West, etc.) to create a tab for each
+            for region_name, group_df in output_df.groupby('Region'):
                 
-                # Write the filtered dataframe to a new sheet named after the region
-                # Use a truncated and safe name for the Excel sheet
-                sheet_name = str(region)[:31] # Excel sheet names have a 31-char limit
-                df_region_specific.to_excel(writer, sheet_name=sheet_name, index=False)
+                # For the output within each tab, we only need the specified four columns
+                final_tab_df = group_df[['VBU', 'Item #', 'Model', 'Region patch code']]
+
+                # Write the dataframe to a new sheet named after the region
+                sheet_name = str(region_name)[:31] # Excel sheet names have a 31-char limit
+                final_tab_df.to_excel(writer, sheet_name=sheet_name, index=False)
         
-        # After the 'with' block, the writer is saved. Now, prepare buffer for download.
         output_buffer.seek(0)
 
         # --- Download Button ---
         st.download_button(
             label="⬇️ Download Paired Data as Excel File",
             data=output_buffer,
-            file_name="paired_output.xlsx",
+            file_name="region_paired_output.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
     except Exception as e:
         st.error(f"An error occurred: {e}")
-        st.warning("Please ensure your files are in the correct format and contain the expected data.")
+        st.warning("Please ensure your files are in the correct format and that region names match between files.")
 
 else:
     st.info("Please upload both spreadsheets to begin processing.")
